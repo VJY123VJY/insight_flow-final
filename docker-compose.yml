@@ -1,0 +1,23 @@
+version: "3.9"
+
+services:
+  insightflow:
+    build: .
+    container_name: insightflow
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      - MDU_BASE_URL=http://mock_mdu:8001
+    depends_on:
+      - mock_mdu
+
+  mock_mdu:
+    build: .
+    container_name: insightflow-mock-mdu
+    command: python mock_mdu.py
+    ports:
+      - "8001:8001"
+    env_file:
+      - .env
