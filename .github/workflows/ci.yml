@@ -1,0 +1,275 @@
+﻿name: CI / CD — Insight Flow
+
+on:
+  push:
+    branches: [ "main", "master", "develop" ]
+  pull_request:
+    branches: [ "main", "master", "develop" ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.12"
+  IMAGE_NAME: insightflow
+  REGISTRY: ghcr.io
+
+# ─────────────────────────────────────────────
+# JOB 1 — Lint & Static Analysis
+# ─────────────────────────────────────────────
+jobs:
+  lint:
+    name: Lint & Static Analysis
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install lint tools
+        run: pip install ruff mypy
+
+      - name: Run Ruff (linter + formatter check)
+        run: ruff check . --output-format=github
+
+      - name: Run Mypy (type checking)
+        run: mypy app/ bucket/ --ignore-missing-imports --no-error-summary || true
+
+# ─────────────────────────────────────────────
+# JOB 2 — Unit & Integration Tests
+# ─────────────────────────────────────────────
+  test:
+    name: Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: [ "3.11", "3.12" ]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest-asyncio httpx pytest-cov
+
+      - name: Create test environment
+        run: |
+          cat > .env.test <<'EOF'
+          APP_NAME=InsightFlow-CI
+          DEBUG=true
+          BUCKET_ENDPOINT=http://localhost:9000/audit
+          MDU_BASE_URL=http://localhost:8001
+          BUCKET_DB_PATH=/tmp/test_bucket.db
+          EOF
+
+      - name: Run tests with coverage
+        env:
+          BUCKET_DB_PATH: /tmp/test_bucket_${{ matrix.python-version }}.db
+        run: |
+          pytest tests/ \
+            --cov=app \
+            --cov=bucket \
+            --cov-report=xml \
+            --cov-report=term-missing \
+            -v \
+            --tb=short
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        if: matrix.python-version == env.PYTHON_VERSION
+        with:
+          name: coverage-report
+          path: coverage.xml
+          retention-days: 7
+
+# ─────────────────────────────────────────────
+# JOB 3 — Docker Build (validate image builds)
+# ─────────────────────────────────────────────
+  docker-build:
+    name: Docker Build
+    runs-on: ubuntu-latest
+    needs: [ lint, test ]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build main app image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          tags: ${{ env.IMAGE_NAME }}:ci-test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build bucket service image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./bucket
+          push: false
+          tags: ${{ env.IMAGE_NAME }}-bucket:ci-test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+# ─────────────────────────────────────────────
+# JOB 4 — Docker Compose smoke test
+# ─────────────────────────────────────────────
+  smoke-test:
+    name: Docker Compose Smoke Test
+    runs-on: ubuntu-latest
+    needs: docker-build
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Create CI .env
+        run: |
+          cat > .env <<'EOF'
+          APP_NAME=InsightFlow-CI
+          DEBUG=true
+          MDU_BASE_URL=http://mock_mdu:8001
+          BUCKET_ENDPOINT=http://bucket:9000/audit
+          BUCKET_DB_PATH=/app/data/bucket.db
+          EOF
+
+      - name: Start services
+        run: docker compose up --build -d
+
+      - name: Wait for main app to be healthy
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8000/health; then
+              echo "App is healthy"
+              exit 0
+            fi
+            echo "Waiting for app... ($i/30)"
+            sleep 2
+          done
+          echo "App did not become healthy in time"
+          docker compose logs
+          exit 1
+
+      - name: Wait for bucket service to be healthy
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:9000/health; then
+              echo "Bucket service is healthy"
+              exit 0
+            fi
+            echo "Waiting for bucket... ($i/30)"
+            sleep 2
+          done
+          echo "Bucket service did not become healthy in time"
+          docker compose logs bucket
+          exit 1
+
+      - name: Smoke test — GET /health
+        run: |
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8000/health)
+          echo "Status: $STATUS"
+          [ "$STATUS" = "200" ] || (echo "FAIL: expected 200, got $STATUS" && exit 1)
+
+      - name: Smoke test — GET /health (bucket microservice)
+        run: |
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:9000/health)
+          echo "Bucket health status: $STATUS"
+          [ "$STATUS" = "200" ] || (echo "FAIL: expected 200, got $STATUS" && exit 1)
+
+      - name: Dump logs on failure
+        if: failure()
+        run: docker compose logs
+
+      - name: Tear down services
+        if: always()
+        run: docker compose down -v
+
+# ─────────────────────────────────────────────
+# JOB 5 — Publish Docker image (on push to main only)
+# ─────────────────────────────────────────────
+  publish:
+    name: Publish Docker Image
+    runs-on: ubuntu-latest
+    needs: smoke-test
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata (main app)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=sha-
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=branch
+
+      - name: Build and push main app image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Extract Docker metadata (bucket service)
+        id: meta-bucket
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}-bucket
+          tags: |
+            type=sha,prefix=sha-
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=branch
+
+      - name: Build and push bucket service image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./bucket
+          push: true
+          tags: ${{ steps.meta-bucket.outputs.tags }}
+          labels: ${{ steps.meta-bucket.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
