@@ -1,0 +1,878 @@
+﻿name: InsightFlow Production CI/CD
+
+on:
+  push:
+    branches:
+      - main
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  IMAGE_NAME: ${{ secrets.DOCKER_USERNAME }}/insightflow
+  DEPLOY_DIR: Insightfllow
+  CONTAINER_NAME: insightflow
+  HOST_PORT: 8122
+  CONTAINER_PORT: 8000
+
+
+jobs:
+
+  # ============================================================
+  # 1. VALIDATE
+  # ============================================================
+
+  validate:
+
+    name: Validate Application
+
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+
+      - name: Set short Git SHA
+        id: vars
+        run: |
+          echo "sha_short=$(git rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
+
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+
+        with:
+          python-version: "3.12"
+
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+
+      - name: Python syntax validation
+        run: |
+          python -m compileall -q .
+
+
+      - name: Check required production files
+        run: |
+          test -f Dockerfile
+          test -f docker-compose.yml
+          test -f main.py
+          test -f requirements.txt
+
+          echo "Production files validated successfully."
+
+
+      - name: Validate Docker Compose
+        env:
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+          IMAGE_TAG: ${{ steps.vars.outputs.sha_short }}
+
+        run: |
+          docker compose config
+
+
+  # ============================================================
+  # 2. BUILD + TEST + PUSH
+  # ============================================================
+
+  build_test_push:
+
+    name: Build Test and Push Docker Image
+
+    runs-on: ubuntu-latest
+
+    needs:
+      - validate
+
+    outputs:
+      sha_short: ${{ steps.vars.outputs.sha_short }}
+
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+
+      - name: Set short Git SHA
+        id: vars
+        run: |
+          echo "sha_short=$(git rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
+
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+
+      # --------------------------------------------------------
+      # Build image using SHA
+      # --------------------------------------------------------
+
+      - name: Build Docker image
+        run: |
+
+          docker build \
+            -t ${{ env.IMAGE_NAME }}:${{ steps.vars.outputs.sha_short }} \
+            .
+
+
+      # --------------------------------------------------------
+      # Run container smoke test
+      # --------------------------------------------------------
+
+      - name: Start container for smoke test
+        run: |
+
+          docker run -d \
+            --name insightflow-test \
+            -p 8000:8000 \
+            ${{ env.IMAGE_NAME }}:${{ steps.vars.outputs.sha_short }}
+
+
+      - name: Wait for application startup
+        run: |
+
+          echo "Waiting for InsightFlow container..."
+
+          for i in {1..12}; do
+
+            if docker ps \
+              --filter "name=insightflow-test" \
+              --filter "status=running" \
+              -q | grep -q .; then
+
+              echo "Container is running."
+
+              break
+
+            fi
+
+
+            if [ "$i" -eq 12 ]; then
+
+              echo "Container failed to start."
+
+              docker logs insightflow-test || true
+
+              exit 1
+
+            fi
+
+
+            sleep 5
+
+          done
+
+
+      # --------------------------------------------------------
+      # Health endpoint
+      # --------------------------------------------------------
+
+      - name: Health check
+        run: |
+
+          echo "Checking InsightFlow health..."
+
+          HEALTHY=0
+
+          for i in {1..12}; do
+
+            if curl -fsS \
+              --max-time 10 \
+              http://127.0.0.1:8000/health; then
+
+              echo ""
+              echo "InsightFlow health check passed."
+
+              HEALTHY=1
+
+              break
+
+            fi
+
+            echo "Health check attempt ${i}/12 failed."
+
+            sleep 5
+
+          done
+
+
+          if [ "$HEALTHY" -ne 1 ]; then
+
+            echo "Health check failed."
+
+            docker logs insightflow-test
+
+            exit 1
+
+          fi
+
+
+      # --------------------------------------------------------
+      # Show logs
+      # --------------------------------------------------------
+
+      - name: Show application logs
+        if: always()
+        run: |
+          docker logs --tail=100 insightflow-test || true
+
+
+      # --------------------------------------------------------
+      # Remove test container
+      # --------------------------------------------------------
+
+      - name: Remove test container
+        if: always()
+        run: |
+          docker rm -f insightflow-test || true
+
+
+      # --------------------------------------------------------
+      # Push SHA image
+      # --------------------------------------------------------
+
+      - name: Push SHA Docker image
+        run: |
+
+          docker push \
+            ${{ env.IMAGE_NAME }}:${{ steps.vars.outputs.sha_short }}
+
+
+  # ============================================================
+  # 3. DEPLOY TO VM
+  # ============================================================
+
+  deploy:
+
+    name: Deploy InsightFlow to VM
+
+    runs-on: ubuntu-latest
+
+    needs:
+      - build_test_push
+
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+
+      - name: Install SSH tools
+        run: |
+
+          sudo apt-get update
+
+          sudo apt-get install -y sshpass
+
+
+      # ========================================================
+      # Create deployment directory
+      # ========================================================
+
+      - name: Create deployment directory
+        run: |
+
+          sshpass -p "${{ secrets.VM_PASSWORD }}" \
+          ssh \
+            -p "${{ secrets.VM_PORT }}" \
+            -o StrictHostKeyChecking=no \
+            "${{ secrets.VM_USERNAME }}@${{ secrets.VM_IP }}" \
+            "mkdir -p '${{ env.DEPLOY_DIR }}'"
+
+
+      # ========================================================
+      # Copy ONLY docker-compose.yml
+      # ========================================================
+
+      - name: Copy Docker Compose
+        run: |
+
+          sshpass -p "${{ secrets.VM_PASSWORD }}" \
+          scp \
+            -P "${{ secrets.VM_PORT }}" \
+            -o StrictHostKeyChecking=no \
+            docker-compose.yml \
+            "${{ secrets.VM_USERNAME }}@${{ secrets.VM_IP }}:${{ env.DEPLOY_DIR }}/docker-compose.yml"
+
+
+      # ========================================================
+      # Create .env from GitHub Secret
+      # ========================================================
+
+      - name: Create production .env
+        run: |
+
+          sshpass -p "${{ secrets.VM_PASSWORD }}" \
+          ssh \
+            -p "${{ secrets.VM_PORT }}" \
+            -o StrictHostKeyChecking=no \
+            "${{ secrets.VM_USERNAME }}@${{ secrets.VM_IP }}" \
+            "bash -s" <<'EOF'
+
+          set -euo pipefail
+
+          cat > "${{ env.DEPLOY_DIR }}/.env" <<'ENVFILE'
+          ${{ secrets.INSIGHTFLOW_ENV_FILE }}
+          ENVFILE
+
+          chmod 600 "${{ env.DEPLOY_DIR }}/.env"
+
+          EOF
+
+
+      # ========================================================
+      # Deploy
+      # ========================================================
+
+      - name: Deploy InsightFlow
+        run: |
+
+          sshpass -p "${{ secrets.VM_PASSWORD }}" \
+          ssh \
+            -p "${{ secrets.VM_PORT }}" \
+            -o StrictHostKeyChecking=no \
+            "${{ secrets.VM_USERNAME }}@${{ secrets.VM_IP }}" \
+            "bash -s" <<'EOF'
+
+          set -euo pipefail
+
+
+          DEPLOY_DIR="${{ env.DEPLOY_DIR }}"
+
+          IMAGE_TAG="${{ needs.build_test_push.outputs.sha_short }}"
+
+          IMAGE_NAME="${{ env.IMAGE_NAME }}"
+
+
+          cd "$DEPLOY_DIR"
+
+
+          echo "=========================================="
+
+          echo "InsightFlow Deployment"
+
+          echo "=========================================="
+
+          echo "Image: ${IMAGE_NAME}:${IMAGE_TAG}"
+
+          echo "Directory: ${DEPLOY_DIR}"
+
+          echo "Port: 8122 -> 8000"
+
+          echo "=========================================="
+
+
+          # ----------------------------------------------------
+          # Verify Docker
+          # ----------------------------------------------------
+
+          docker version
+
+          docker compose version
+
+
+          # ----------------------------------------------------
+          # Save current version for rollback
+          # ----------------------------------------------------
+
+          CURRENT_TAG=""
+
+
+          if docker inspect insightflow >/dev/null 2>&1; then
+
+            CURRENT_IMAGE=$(docker inspect \
+              --format='{{.Config.Image}}' \
+              insightflow)
+
+
+            CURRENT_TAG="${CURRENT_IMAGE##*:}"
+
+
+            echo "Currently deployed image: ${CURRENT_IMAGE}"
+
+            echo "Current tag: ${CURRENT_TAG}"
+
+
+          elif [ -f .last_successful_tag ]; then
+
+            CURRENT_TAG=$(cat .last_successful_tag)
+
+
+            echo "Previous successful tag: ${CURRENT_TAG}"
+
+
+          else
+
+            echo "No previous deployment found."
+
+            echo "This is the first deployment."
+
+          fi
+
+
+          # ----------------------------------------------------
+          # Save rollback candidate
+          # ----------------------------------------------------
+
+          if [ -n "$CURRENT_TAG" ]; then
+
+            echo "$CURRENT_TAG" > .previous_tag
+
+          else
+
+            rm -f .previous_tag
+
+          fi
+
+
+          # ----------------------------------------------------
+          # Set Compose variables
+          # ----------------------------------------------------
+
+          export IMAGE_NAME="${IMAGE_NAME}"
+
+          export IMAGE_TAG="${IMAGE_TAG}"
+
+
+          # ----------------------------------------------------
+          # Validate compose
+          # ----------------------------------------------------
+
+          docker compose config
+
+
+          # ----------------------------------------------------
+          # Login Docker Hub
+          # ----------------------------------------------------
+
+          echo "${{ secrets.DOCKER_PASSWORD }}" | \
+            docker login \
+              --username "${{ secrets.DOCKER_USERNAME }}" \
+              --password-stdin
+
+
+          # ----------------------------------------------------
+          # Pull exact SHA image
+          # ----------------------------------------------------
+
+          docker compose pull
+
+
+          # ----------------------------------------------------
+          # Start new deployment
+          # ----------------------------------------------------
+
+          docker compose up -d --remove-orphans
+
+
+          # ----------------------------------------------------
+          # Docker Hub logout
+          # ----------------------------------------------------
+
+          docker logout
+
+
+          # ----------------------------------------------------
+          # Show containers
+          # ----------------------------------------------------
+
+          docker compose ps
+
+
+          # ----------------------------------------------------
+          # Health check
+          # ----------------------------------------------------
+
+          echo ""
+
+          echo "Waiting for InsightFlow..."
+
+          HEALTHY=0
+
+
+          for i in {1..18}; do
+
+            echo "Health check attempt ${i}/18..."
+
+
+            CONTAINER_STATUS=$(docker inspect \
+              --format='{{.State.Status}}' \
+              insightflow 2>/dev/null || echo "missing")
+
+
+            echo "Container status: ${CONTAINER_STATUS}"
+
+
+            if [ "${CONTAINER_STATUS}" = "exited" ] || \
+               [ "${CONTAINER_STATUS}" = "dead" ]; then
+
+              echo "InsightFlow container stopped unexpectedly."
+
+              docker compose ps
+
+              docker compose logs --tail=150
+
+              exit 1
+
+            fi
+
+
+            # --------------------------------------------------
+            # Application health endpoint
+            # --------------------------------------------------
+
+            if curl -fsS \
+              --max-time 10 \
+              http://127.0.0.1:8122/health \
+              >/tmp/insightflow-health.json; then
+
+
+              echo "InsightFlow health endpoint responded."
+
+              cat /tmp/insightflow-health.json
+
+
+              HEALTHY=1
+
+              break
+
+            else
+
+              echo "InsightFlow is not ready yet."
+
+            fi
+
+
+            sleep 10
+
+          done
+
+
+          # ----------------------------------------------------
+          # Deployment failed
+          # ----------------------------------------------------
+
+          if [ "$HEALTHY" -ne 1 ]; then
+
+            echo ""
+
+            echo "=========================================="
+
+            echo "DEPLOYMENT HEALTH CHECK FAILED"
+
+            echo "=========================================="
+
+
+            docker compose ps
+
+            docker compose logs --tail=150
+
+
+            exit 1
+
+          fi
+
+
+          # ----------------------------------------------------
+          # Deployment successful
+          # ----------------------------------------------------
+
+          echo ""
+
+          echo "=========================================="
+
+          echo "DEPLOYMENT SUCCESSFUL"
+
+          echo "=========================================="
+
+
+          echo "${IMAGE_TAG}" > .last_successful_tag
+
+
+          rm -f .previous_tag
+
+
+          docker image prune -f
+
+
+          echo "Successfully deployed:"
+
+          echo "${IMAGE_NAME}:${IMAGE_TAG}"
+
+
+          EOF
+
+
+  # ============================================================
+  # 4. AUTOMATIC ROLLBACK
+  # ============================================================
+
+  rollback:
+
+    name: Automatic Rollback
+
+    runs-on: ubuntu-latest
+
+
+    needs:
+      - build_test_push
+      - deploy
+
+
+    if: always() && needs.deploy.result == 'failure'
+
+
+    steps:
+
+      - name: Install SSH tools
+        run: |
+
+          sudo apt-get update
+
+          sudo apt-get install -y sshpass
+
+
+      - name: Rollback InsightFlow
+        run: |
+
+          sshpass -p "${{ secrets.VM_PASSWORD }}" \
+          ssh \
+            -p "${{ secrets.VM_PORT }}" \
+            -o StrictHostKeyChecking=no \
+            "${{ secrets.VM_USERNAME }}@${{ secrets.VM_IP }}" \
+            "bash -s" <<'EOF'
+
+          set -euo pipefail
+
+
+          DEPLOY_DIR="${{ env.DEPLOY_DIR }}"
+
+          cd "$DEPLOY_DIR"
+
+
+          echo "=========================================="
+
+          echo "AUTOMATIC ROLLBACK"
+
+          echo "=========================================="
+
+
+          # ----------------------------------------------------
+          # Determine previous successful SHA
+          # ----------------------------------------------------
+
+          ROLLBACK_TAG=""
+
+
+          if [ -f .previous_tag ]; then
+
+            ROLLBACK_TAG=$(cat .previous_tag)
+
+          elif [ -f .last_successful_tag ]; then
+
+            ROLLBACK_TAG=$(cat .last_successful_tag)
+
+          fi
+
+
+          # ----------------------------------------------------
+          # No rollback version
+          # ----------------------------------------------------
+
+          if [ -z "$ROLLBACK_TAG" ]; then
+
+            echo "No previous successful deployment found."
+
+            echo "Rollback is not possible because this is the first deployment."
+
+
+            docker compose ps || true
+
+            docker compose logs --tail=150 || true
+
+
+            exit 1
+
+          fi
+
+
+          echo "Rolling back to:"
+
+          echo "${{ env.IMAGE_NAME }}:${ROLLBACK_TAG}"
+
+
+          # ----------------------------------------------------
+          # Set rollback image
+          # ----------------------------------------------------
+
+          export IMAGE_NAME="${{ env.IMAGE_NAME }}"
+
+          export IMAGE_TAG="${ROLLBACK_TAG}"
+
+
+          # ----------------------------------------------------
+          # Validate compose
+          # ----------------------------------------------------
+
+          docker compose config
+
+
+          # ----------------------------------------------------
+          # Docker Hub login
+          # ----------------------------------------------------
+
+          echo "${{ secrets.DOCKER_PASSWORD }}" | \
+            docker login \
+              --username "${{ secrets.DOCKER_USERNAME }}" \
+              --password-stdin
+
+
+          # ----------------------------------------------------
+          # Pull previous SHA image
+          # ----------------------------------------------------
+
+          docker compose pull
+
+
+          # ----------------------------------------------------
+          # Restart previous version
+          # ----------------------------------------------------
+
+          docker compose up -d --remove-orphans
+
+
+          docker logout
+
+
+          # ----------------------------------------------------
+          # Rollback health check
+          # ----------------------------------------------------
+
+          echo ""
+
+          echo "Waiting for rollback deployment..."
+
+          HEALTHY=0
+
+
+          for i in {1..18}; do
+
+            echo "Rollback health check ${i}/18..."
+
+
+            CONTAINER_STATUS=$(docker inspect \
+              --format='{{.State.Status}}' \
+              insightflow 2>/dev/null || echo "missing")
+
+
+            echo "Container status: ${CONTAINER_STATUS}"
+
+
+            if [ "${CONTAINER_STATUS}" = "exited" ] || \
+               [ "${CONTAINER_STATUS}" = "dead" ]; then
+
+              echo "Rollback container stopped."
+
+              docker compose ps
+
+              docker compose logs --tail=150
+
+              exit 1
+
+            fi
+
+
+            if curl -fsS \
+              --max-time 10 \
+              http://127.0.0.1:8122/health \
+              >/tmp/insightflow-rollback-health.json; then
+
+
+              echo "Rollback health check passed."
+
+              cat /tmp/insightflow-rollback-health.json
+
+
+              HEALTHY=1
+
+              break
+
+            fi
+
+
+            sleep 10
+
+          done
+
+
+          # ----------------------------------------------------
+          # Rollback failed
+          # ----------------------------------------------------
+
+          if [ "$HEALTHY" -ne 1 ]; then
+
+            echo ""
+
+            echo "=========================================="
+
+            echo "ROLLBACK FAILED"
+
+            echo "=========================================="
+
+
+            docker compose ps
+
+            docker compose logs --tail=150
+
+
+            exit 1
+
+          fi
+
+
+          # ----------------------------------------------------
+          # Rollback successful
+          # ----------------------------------------------------
+
+          echo ""
+
+          echo "=========================================="
+
+          echo "ROLLBACK SUCCESSFUL"
+
+          echo "=========================================="
+
+
+          echo "${ROLLBACK_TAG}" > .last_successful_tag
+
+
+          rm -f .previous_tag
+
+
+          docker image prune -f
+
+
+          echo "Production restored to:"
+
+          echo "${{ env.IMAGE_NAME }}:${ROLLBACK_TAG}"
+
+
+          EOF
