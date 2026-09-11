@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+python-jose[cryptography]
+httpx
+pydantic-settings
+sqlalchemy
+aiosqlite
+# For metrics/telemetry
+prometheus-client
+# For testing
+pytest
+pytest-asyncio

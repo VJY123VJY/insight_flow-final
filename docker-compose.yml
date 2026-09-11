@@ -1,0 +1,46 @@
+version: "3.9"
+
+services:
+  insightflow:
+    build: .
+    container_name: insightflow
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      - MDU_BASE_URL=http://mock_mdu:8001
+      - BUCKET_ENDPOINT=http://bucket:9000/audit
+    depends_on:
+      - mock_mdu
+      - bucket
+
+  mock_mdu:
+    build: .
+    container_name: insightflow-mock-mdu
+    command: python mock_mdu.py
+    ports:
+      - "8001:8001"
+    env_file:
+      - .env
+
+  bucket:
+    build: ./bucket
+    container_name: insightflow-bucket
+    ports:
+      - "9000:9000"
+    environment:
+      - BUCKET_DB_PATH=/app/data/bucket.db
+      - HOST=0.0.0.0
+      - PORT=9000
+    volumes:
+      - bucket_data:/app/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  bucket_data:
